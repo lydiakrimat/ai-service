@@ -1,0 +1,45 @@
+# =============================================================================
+# requirements.txt — Dependances du AI Service ALPR
+# =============================================================================
+# Installation :
+#   pip install -r requirements.txt
+#
+# Note GPU : remplacer paddlepaddle==3.3.0 par paddlepaddle-gpu==3.3.0
+#            si vous avez un GPU NVIDIA avec CUDA.
+# =============================================================================
+
+# --- Serveur HTTP ---
+fastapi
+uvicorn[standard]
+
+# --- Traitement d'images ---
+opencv-python
+numpy
+Pillow
+
+# --- Detection YOLOX (deep learning) ---
+torch
+torchvision
+# Dependances minimales de YOLOX pour l'inference (sans cmake/onnx)
+tabulate          # yolox/exp/base_exp.py
+loguru            # yolox/utils/dist.py
+thop              # yolox (comptage des FLOPs)
+ninja             # compilation des ops CUDA
+
+# --- OCR ---
+# GPU :  paddlepaddle-gpu==3.3.0
+# CPU :
+paddlepaddle==3.3.0
+paddleocr
+
+# --- Utilitaires FastAPI ---
+python-multipart
+
+# --- Client HTTP async (pour POST /verify → Laravel) ---
+httpx
+
+# --- Chargement automatique du fichier .env ---
+python-dotenv
+
+# --- Tests (pour test_api.py) ---
+requests

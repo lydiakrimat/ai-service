@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment variables
+.env
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Training data (not needed for inference)
+dataset/
+
+# Training logs & runs
+runs/
+wandb/
+
+# Large model files (>100MB) — download separately if needed
+# models/*.pth files under 100MB are committed (e.g. best_ckpt.pth at 69MB)
+
+# Test results (local only)
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
