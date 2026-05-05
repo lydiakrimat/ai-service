@@ -316,6 +316,125 @@ async def verify(body: VerifyRequest):
 
 
 # ---------------------------------------------------------------------------
+# POST /verify-lookup — Consultation matricule sans enregistrement (saisie manuelle)
+# ---------------------------------------------------------------------------
+@app.post("/verify-lookup")
+async def verify_lookup(body: VerifyRequest):
+    """
+    Consulte un vehicule par matricule sans enregistrer d'acces en BDD.
+
+    Difference avec POST /verify :
+      - /verify      : verifie le vehicule ET enregistre automatiquement l'acces
+                       si autorise. Utilise par le scanner camera et les tests.
+      - /verify-lookup : verifie uniquement, aucun enregistrement en BDD.
+                         Utilise par la saisie manuelle depuis l'application mobile.
+                         L'agent choisit ensuite de valider ou non l'entree via
+                         le bouton dedie dans l'ecran de recherche.
+
+    Requete  : {"plate_text": "ALG288", "confidence": 0.0 (optionnel)}
+    Reponse  : meme structure que /verify, avec en plus vehicle_id et employee_id
+               pour permettre l'enregistrement explicite cote Flutter.
+               acces_enregistre est toujours False.
+    """
+    logger.info("POST /verify-lookup — matricule : %s", body.plate_text)
+
+    # Etape 1 : fuzzy matching sur le cache local des matricules.
+    # Identique a la logique de check_vehicle() dans backend.py,
+    # sauf que record_access() n'est jamais appele dans cet endpoint.
+    try:
+        match = await vehicle_cache.get_best_match(
+            body.plate_text,
+            backend_url=BACKEND_URL,
+            threshold=0.80,
+        )
+    except Exception as e:
+        logger.exception("Erreur vehicle_cache /verify-lookup : %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Matricule non trouve dans le cache (fuzzy matching sous le seuil ou cache vide).
+    if match is None:
+        return JSONResponse(content={
+            "detected":         False,
+            "plate_ocr":        body.plate_text,
+            "authorized":       False,
+            "reason":           "vehicle_not_found",
+            "plate_matched":    None,
+            "similarity_score": 0.0,
+            "confidence":       None,
+            "bounding_box":     None,
+            "vehicle":          None,
+            "owner":            None,
+            "vehicle_id":       None,
+            "employee_id":      None,
+            "acces_enregistre": False,
+        })
+
+    plate_corrige = match["vehicle"]["plate_number"]
+    similarity    = match["similarity"]
+
+    # Etape 2 : appel Laravel pour obtenir les details vehicule et proprietaire.
+    # POST /api/vehicles/check est une consultation pure — aucun effet en BDD.
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{BACKEND_URL}/api/vehicles/check",
+                json={"plate_number": plate_corrige},
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        logger.warning("Laravel inaccessible lors de /verify-lookup : %s", e)
+        return JSONResponse(
+            content={"error": "backend_unavailable"},
+            status_code=503,
+        )
+
+    authorized = data.get("authorized", False)
+    vehicle    = data.get("vehicle") or match["vehicle"]
+    owner      = data.get("owner")
+
+    # Extraire les identifiants avant formatage pour les exposer dans la reponse.
+    # Flutter les utilise pour appeler POST /api/acces apres confirmation de l'agent.
+    vehicle_id  = vehicle.get("id")          if vehicle else None
+    employee_id = vehicle.get("employee_id") if vehicle else None
+
+    # Format vehicule standard pour la reponse JSON.
+    vehicle_out = {
+        "id":            vehicle.get("id"),
+        "plate_number":  vehicle.get("plate_number"),
+        "brand":         vehicle.get("brand"),
+        "color":         vehicle.get("color"),
+        "is_authorized": vehicle.get("is_authorized"),
+    } if vehicle else None
+
+    reason = None if authorized else "vehicle_not_authorized"
+
+    logger.info(
+        "POST /verify-lookup — matched=%s | authorized=%s | sim=%.2f",
+        plate_corrige, authorized, similarity,
+    )
+
+    return JSONResponse(content={
+        "detected":         True,
+        "plate_ocr":        body.plate_text,
+        "authorized":       authorized,
+        "reason":           reason,
+        "plate_matched":    plate_corrige,
+        "similarity_score": round(similarity, 4),
+        "confidence":       None,
+        "bounding_box":     None,
+        "vehicle":          vehicle_out,
+        "owner":            owner,
+        # Identifiants exposes pour l'enregistrement explicite depuis Flutter.
+        "vehicle_id":       vehicle_id,
+        "employee_id":      employee_id,
+        # Toujours False : cet endpoint ne cree jamais d'enregistrement en BDD.
+        "acces_enregistre": False,
+    })
+
+
+# ---------------------------------------------------------------------------
 # POST /scan/debug — Pipeline complet avec mesure de temps par étape
 # ---------------------------------------------------------------------------
 @app.post("/scan/debug")
