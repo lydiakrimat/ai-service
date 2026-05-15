@@ -373,11 +373,11 @@ async def verify_lookup(body: VerifyRequest):
     similarity    = match["similarity"]
 
     # Etape 2 : appel Laravel pour obtenir les details vehicule et proprietaire.
-    # POST /api/vehicles/check est une consultation pure — aucun effet en BDD.
+    # POST /api/service/vehicles/check est une consultation pure — aucun effet en BDD.
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{BACKEND_URL}/api/vehicles/check",
+                f"{BACKEND_URL}/api/service/vehicles/check",
                 json={"plate_number": plate_corrige},
                 headers={"Accept": "application/json"},
             )
@@ -495,11 +495,11 @@ async def scan_debug(image: UploadFile = File(...)):
     plate_corrige = match["vehicle"]["plate_number"]
     similarity = match["similarity"]
 
-    # Étape 3 : Appel Laravel POST /api/vehicles/check
+    # Étape 3 : Appel Laravel POST /api/service/vehicles/check
     t_laravel = _time.perf_counter()
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
-            f"{BACKEND_URL}/api/vehicles/check",
+            f"{BACKEND_URL}/api/service/vehicles/check",
             json={"plate_number": plate_corrige},
             headers={"Accept": "application/json"},
         )

@@ -29,6 +29,7 @@
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -45,6 +46,11 @@ logger = logging.getLogger("alpr.backend")
 
 # URL du backend Laravel — configurable via BACKEND_URL dans .env
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+
+# Préfixe des routes internes (sans auth Sanctum)
+_SERVICE_PREFIX = f"{BACKEND_URL}/api/service"
+
+_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
 # ---------------------------------------------------------------------------
 # Cooldown anti-doublon pour l'enregistrement des accès
@@ -112,12 +118,9 @@ async def record_access(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
-            f"{BACKEND_URL}/api/acces",
+            f"{_SERVICE_PREFIX}/acces",
             json=payload,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=_HEADERS,
         )
         resp.raise_for_status()
 
@@ -163,21 +166,26 @@ async def check_vehicle(plate_ocr: str) -> dict:
     if match is None:
         return _not_found(0.0)
 
-    # --- Étape 2 : Matricule corrigé → vérifier autorisation sur Laravel ---
-    plate_corrige = match["vehicle"]["plate_number"]
+    # --- Étape 2 : Vérifier si c'est un véhicule temporaire ---
+    matched_vehicle = match["vehicle"]
+    plate_corrige = matched_vehicle["plate_number"]
     similarity = match["similarity"]
 
+    if matched_vehicle.get("is_temporaire"):
+        return await _handle_temporaire(matched_vehicle, plate_corrige, similarity)
+
+    # --- Étape 3 : Véhicule permanent → vérifier autorisation sur Laravel ---
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
-            f"{BACKEND_URL}/api/vehicles/check",
+            f"{_SERVICE_PREFIX}/vehicles/check",
             json={"plate_number": plate_corrige},
-            headers={"Accept": "application/json"},
+            headers=_HEADERS,
         )
         resp.raise_for_status()
         data = resp.json()
 
     authorized = data.get("authorized", False)
-    vehicle = data.get("vehicle") or match["vehicle"]
+    vehicle = data.get("vehicle") or matched_vehicle
     owner = data.get("owner")
 
     logger.info(
@@ -199,9 +207,6 @@ async def check_vehicle(plate_ocr: str) -> dict:
     # Véhicule autorisé : enregistrer l'accès dans l'historique Laravel.
     # Le cooldown évite les doublons si le WebSocket traite plusieurs frames.
     vehicle_id  = vehicle.get("id")
-    # employee_id récupéré ICI depuis le dict brut de Laravel,
-    # avant que _format_vehicle() soit appelé — cette fonction retire employee_id
-    # du dict pour ne pas l'exposer dans la réponse API finale.
     employee_id = vehicle.get("employee_id")
     acces_enregistre = False
 
@@ -209,8 +214,6 @@ async def check_vehicle(plate_ocr: str) -> dict:
         try:
             acces_enregistre = await record_access(plate_corrige, vehicle_id, employee_id)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-            # L'enregistrement a échoué, mais on retourne quand même "autorisé".
-            # Un échec d'écriture BDD ne doit pas bloquer le passage du véhicule.
             logger.warning(
                 "Echec enregistrement acces pour %s (vehicle_id=%s) : %s",
                 plate_corrige, vehicle_id, e,
@@ -226,6 +229,84 @@ async def check_vehicle(plate_ocr: str) -> dict:
         "acces_enregistre": acces_enregistre,
     }
 
+
+
+async def _handle_temporaire(
+    vehicule: dict,
+    plate_corrige: str,
+    similarity: float,
+) -> dict:
+    """
+    Gère l'accès d'un véhicule temporaire (visiteur pré-autorisé).
+    1. Enregistre l'accès dans la table acces via POST /api/acces
+    2. Met à jour le statut du véhicule temporaire à "entré" via PATCH
+    3. Invalide le cache pour que le véhicule ne soit plus matché
+    """
+    vt_id = vehicule.get("id")
+    acces_enregistre = False
+
+    # Cooldown anti-doublon
+    maintenant = time.monotonic()
+    dernier = _derniers_acces.get(plate_corrige, 0.0)
+    if maintenant - dernier < _ACCES_COOLDOWN_SECONDES:
+        logger.info("Cooldown actif pour véhicule temporaire %s.", plate_corrige)
+        return {
+            "authorized": True,
+            "reason": None,
+            "type": "temporaire",
+            "plate_matched": plate_corrige,
+            "similarity_score": round(similarity, 4),
+            "vehicle": vehicule,
+            "owner": None,
+            "acces_enregistre": False,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # POST /api/acces — enregistrer l'entrée du visiteur
+            payload_acces = {
+                "type_acces": "Temporaire",
+                "nom_visiteur": vehicule.get("nom_visiteur", ""),
+                "prenom_visiteur": vehicule.get("prenom_visiteur", ""),
+                "plate_number_visiteur": plate_corrige,
+                "duree_autorisee": vehicule.get("duree_autorisee", 60),
+                "dateHeureEntree": datetime.now().isoformat(),
+                "statut": "Autorise",
+            }
+            resp_acces = await client.post(
+                f"{_SERVICE_PREFIX}/acces",
+                json=payload_acces,
+                headers=_HEADERS,
+            )
+            resp_acces.raise_for_status()
+            acces_enregistre = True
+
+            # PUT /api/service/vehicules-temporaires/{id} — marquer "entré"
+            resp_patch = await client.put(
+                f"{_SERVICE_PREFIX}/vehicules-temporaires/{vt_id}",
+                json={"statut": "entré"},
+                headers=_HEADERS,
+            )
+            resp_patch.raise_for_status()
+
+        # Invalider le cache pour retirer ce véhicule temporaire
+        vehicle_cache.invalidate_cache()
+        _derniers_acces[plate_corrige] = maintenant
+        logger.info("Véhicule temporaire %s (id=%s) : accès enregistré, statut → entré.", plate_corrige, vt_id)
+
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        logger.warning("Echec traitement véhicule temporaire %s : %s", plate_corrige, e)
+
+    return {
+        "authorized": True,
+        "reason": None,
+        "type": "temporaire",
+        "plate_matched": plate_corrige,
+        "similarity_score": round(similarity, 4),
+        "vehicle": vehicule,
+        "owner": None,
+        "acces_enregistre": acces_enregistre,
+    }
 
 
 def _format_vehicle(v: dict) -> dict:

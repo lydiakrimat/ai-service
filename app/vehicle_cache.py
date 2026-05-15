@@ -18,6 +18,9 @@ from matcher import fuzzy_match
 
 logger = logging.getLogger("alpr.cache")
 
+# Headers simples — les routes /api/service/* n'exigent pas d'authentification
+_HEADERS = {"Accept": "application/json"}
+
 # Durée de validité du cache en secondes (5 minutes)
 CACHE_TTL = 300
 
@@ -27,16 +30,36 @@ _cache_timestamp: float = 0.0
 
 async def _load_vehicles(backend_url: str) -> list:
     """
-    Appelle GET /api/vehicles sur Laravel et retourne la liste complète.
-    Appelé uniquement quand le cache est vide ou expiré.
+    Appelle GET /api/vehicles et GET /api/vehicules-temporaires sur Laravel.
+    Fusionne les véhicules permanents et les temporaires (statut=en_attente)
+    dans une seule liste. Les temporaires portent is_temporaire=True.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{backend_url}/api/vehicles",
-            headers={"Accept": "application/json"},
+        # Véhicules permanents
+        resp_perm = await client.get(
+            f"{backend_url}/api/service/vehicles",
+            headers=_HEADERS,
         )
-        response.raise_for_status()
-        return response.json()
+        resp_perm.raise_for_status()
+        vehicles = resp_perm.json()
+
+        # Véhicules temporaires (seuls ceux en_attente sont chargés)
+        try:
+            resp_temp = await client.get(
+                f"{backend_url}/api/service/vehicules-temporaires",
+                headers=_HEADERS,
+            )
+            resp_temp.raise_for_status()
+            temporaires = resp_temp.json()
+
+            for vt in temporaires:
+                if vt.get("statut") == "en_attente":
+                    vt["is_temporaire"] = True
+                    vehicles.append(vt)
+        except (httpx.HTTPStatusError, httpx.ConnectError) as e:
+            logger.warning("Impossible de charger les véhicules temporaires : %s", e)
+
+        return vehicles
 
 
 async def get_best_match(
