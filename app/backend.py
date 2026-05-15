@@ -134,6 +134,36 @@ async def record_access(
     return True
 
 
+async def creer_notification(
+    backend_url: str,
+    type_notif: str,
+    message: str,
+    plate_number: str = None,
+    vehicule_temporaire_id: int = None,
+):
+    """
+    Envoie une notification au backend Laravel.
+    Appelee sans token car la route POST /api/notifications est publique.
+    """
+    payload = {
+        "type": type_notif,
+        "message": message,
+        "plate_number": plate_number,
+        "vehicule_temporaire_id": vehicule_temporaire_id,
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(
+                f"{backend_url}/api/notifications",
+                json=payload,
+                timeout=5.0,
+            )
+        except Exception:
+            # La notification est non bloquante — une erreur ne doit pas
+            # faire echouer le pipeline de scan
+            pass
+
+
 async def check_vehicle(plate_ocr: str) -> dict:
     """
     Vérifie si un véhicule est autorisé à accéder au site.
@@ -164,6 +194,13 @@ async def check_vehicle(plate_ocr: str) -> dict:
     )
 
     if match is None:
+        # Plaque inconnue — creer une notification de refus
+        await creer_notification(
+            backend_url=BACKEND_URL,
+            type_notif="refus_acces",
+            message=f"Plaque inconnue detectee — {plate_ocr}",
+            plate_number=plate_ocr,
+        )
         return _not_found(0.0)
 
     # --- Étape 2 : Vérifier si c'est un véhicule temporaire ---
@@ -194,6 +231,13 @@ async def check_vehicle(plate_ocr: str) -> dict:
     )
 
     if not authorized:
+        # Vehicule non autorise — creer une notification de refus
+        await creer_notification(
+            backend_url=BACKEND_URL,
+            type_notif="refus_acces",
+            message=f"Tentative d'acces refusee — plaque {plate_corrige}",
+            plate_number=plate_corrige,
+        )
         return {
             "authorized": False,
             "reason": "vehicle_not_authorized",

@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from backend import check_vehicle
 from pipeline import process_frame
+from expiration_checker import verifier_expirations
 import vehicle_cache
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,11 @@ async def lifespan(app: FastAPI):
         logger.info("Cache véhicules préchargé au démarrage.")
     except Exception as e:
         logger.warning("Préchargement cache échoué (non bloquant) : %s", e)
+
+    # Lancer le verificateur d'expirations en tache de fond
+    # Verifie toutes les 60 secondes les acces temporaires expires
+    asyncio.create_task(verifier_expirations(BACKEND_URL))
+    logger.info("Expiration checker lance en arriere-plan.")
 
     yield
 
