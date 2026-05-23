@@ -94,38 +94,50 @@ async def get_best_match(
 
     plate_upper = plate_ocr.upper()
 
-    # Match exact d'abord (O(n), comparaison string == très rapide)
-    for vehicle in _cache_vehicles:
-        if vehicle.get("plate_number", "").upper() == plate_upper:
-            logger.info("Match exact : %s", vehicle["plate_number"])
-            return {"vehicle": vehicle, "similarity": 1.0}
-
-    # Pas de match exact : fuzzy sur tout le cache
-    best_score = 0.0
-    best_vehicle = None
+    # Collecter tous les candidats (exact + fuzzy) avec leur score.
+    # On ne s'arrête plus au premier match exact : un même matricule
+    # peut exister en tant que permanent ET temporaire en_attente.
+    candidats: list[tuple[dict, float]] = []
 
     for vehicle in _cache_vehicles:
         plate_bdd = vehicle.get("plate_number", "").upper()
-        score = fuzzy_match(plate_upper, plate_bdd)
-        if score > best_score:
-            best_score = score
-            best_vehicle = vehicle
+        if plate_bdd == plate_upper:
+            candidats.append((vehicle, 1.0))
+        else:
+            score = fuzzy_match(plate_upper, plate_bdd)
+            if score >= threshold:
+                candidats.append((vehicle, score))
 
-    if best_score >= threshold:
+    if not candidats:
+        logger.info("Aucun match pour '%s' (seuil %.0f%%).", plate_ocr, threshold * 100)
+        return None
+
+    # Priorité : temporaire en_attente (1) > permanent autorisé (2) > permanent refusé (3).
+    # À priorité égale, le score de similarité le plus élevé l'emporte.
+    def _priorite(item: tuple[dict, float]) -> tuple[int, float]:
+        v, score = item
+        if v.get("is_temporaire"):
+            rang = 1
+        elif v.get("is_authorized"):
+            rang = 2
+        else:
+            rang = 3
+        # rang ascendant (1 = meilleur), score descendant (plus haut = meilleur)
+        return (rang, -score)
+
+    meilleur, meilleur_score = min(candidats, key=_priorite)
+
+    if meilleur_score >= 1.0:
+        logger.info("Match exact : %s (priorité appliquée)", meilleur["plate_number"])
+    else:
         logger.info(
             "Match flou : '%s' -> '%s' (%.1f%%)",
             plate_ocr,
-            best_vehicle["plate_number"],
-            best_score * 100,
+            meilleur["plate_number"],
+            meilleur_score * 100,
         )
-        return {"vehicle": best_vehicle, "similarity": best_score}
 
-    logger.info(
-        "Aucun match : meilleur score %.1f%% < seuil %.0f%%",
-        best_score * 100,
-        threshold * 100,
-    )
-    return None
+    return {"vehicle": meilleur, "similarity": meilleur_score}
 
 
 def invalidate_cache() -> None:

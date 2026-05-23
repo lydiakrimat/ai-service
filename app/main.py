@@ -375,10 +375,50 @@ async def verify_lookup(body: VerifyRequest):
             "acces_enregistre": False,
         })
 
-    plate_corrige = match["vehicle"]["plate_number"]
-    similarity    = match["similarity"]
+    matched_vehicle = match["vehicle"]
+    plate_corrige   = matched_vehicle["plate_number"]
+    similarity      = match["similarity"]
 
-    # Etape 2 : appel Laravel pour obtenir les details vehicule et proprietaire.
+    # Etape 2 : vehicule temporaire en_attente → autorise directement.
+    # Le cache ne contient que les temporaires statut="en_attente",
+    # donc toute entree is_temporaire=True ici est valide.
+    # Consultation pure : aucun enregistrement, aucun changement de statut.
+    if matched_vehicle.get("is_temporaire"):
+        logger.info(
+            "POST /verify-lookup — temporaire en_attente : %s (sim=%.2f)",
+            plate_corrige, similarity,
+        )
+        vehicle_out = {
+            "id":            matched_vehicle.get("id"),
+            "plate_number":  matched_vehicle.get("plate_number"),
+            "brand":         matched_vehicle.get("brand"),
+            "color":         matched_vehicle.get("color"),
+            "is_authorized": True,
+        }
+        return JSONResponse(content={
+            "detected":         True,
+            "plate_ocr":        body.plate_text,
+            "authorized":       True,
+            "reason":           None,
+            "type":             "temporaire",
+            "plate_matched":    plate_corrige,
+            "similarity_score": round(similarity, 4),
+            "confidence":       None,
+            "bounding_box":     None,
+            "vehicle":          vehicle_out,
+            "owner": {
+                "nom":             matched_vehicle.get("nom_visiteur", ""),
+                "prenom":          matched_vehicle.get("prenom_visiteur", ""),
+                "telephone":       matched_vehicle.get("telephone"),
+                "motif_visite":    matched_vehicle.get("motif_visite"),
+                "duree_autorisee": matched_vehicle.get("duree_autorisee"),
+            },
+            "vehicle_id":       matched_vehicle.get("id"),
+            "employee_id":      None,
+            "acces_enregistre": False,
+        })
+
+    # Etape 3 : vehicule permanent → appel Laravel pour les details.
     # POST /api/service/vehicles/check est une consultation pure — aucun effet en BDD.
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -397,8 +437,51 @@ async def verify_lookup(body: VerifyRequest):
         )
 
     authorized = data.get("authorized", False)
-    vehicle    = data.get("vehicle") or match["vehicle"]
+    vehicle    = data.get("vehicle") or matched_vehicle
     owner      = data.get("owner")
+
+    # Permanent refuse — verifier s'il existe un temporaire en_attente
+    # pour le meme matricule avant de conclure au refus definitif.
+    if not authorized:
+        for v in vehicle_cache._cache_vehicles:
+            if (
+                v.get("plate_number", "").upper() == plate_corrige.upper()
+                and v.get("is_temporaire")
+            ):
+                logger.info(
+                    "POST /verify-lookup — permanent refuse pour %s, "
+                    "temporaire en_attente trouve, fallback.",
+                    plate_corrige,
+                )
+                vehicle_out = {
+                    "id":            v.get("id"),
+                    "plate_number":  v.get("plate_number"),
+                    "brand":         v.get("brand"),
+                    "color":         v.get("color"),
+                    "is_authorized": True,
+                }
+                return JSONResponse(content={
+                    "detected":         True,
+                    "plate_ocr":        body.plate_text,
+                    "authorized":       True,
+                    "reason":           None,
+                    "type":             "temporaire",
+                    "plate_matched":    plate_corrige,
+                    "similarity_score": round(similarity, 4),
+                    "confidence":       None,
+                    "bounding_box":     None,
+                    "vehicle":          vehicle_out,
+                    "owner": {
+                        "nom":             v.get("nom_visiteur", ""),
+                        "prenom":          v.get("prenom_visiteur", ""),
+                        "telephone":       v.get("telephone"),
+                        "motif_visite":    v.get("motif_visite"),
+                        "duree_autorisee": v.get("duree_autorisee"),
+                    },
+                    "vehicle_id":       v.get("id"),
+                    "employee_id":      None,
+                    "acces_enregistre": False,
+                })
 
     # Extraire les identifiants avant formatage pour les exposer dans la reponse.
     # Flutter les utilise pour appeler POST /api/acces apres confirmation de l'agent.
@@ -594,6 +677,7 @@ async def ws_detect(websocket: WebSocket):
                             "plate_matched": check["plate_matched"],
                             "similarity_score": check["similarity_score"],
                             "authorized": check["authorized"],
+                            "type": check.get("type"),
                             "reason": check["reason"],
                             "confidence": ai_result["confidence"],
                             "bounding_box": ai_result["bounding_box"],

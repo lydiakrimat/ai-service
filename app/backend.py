@@ -231,11 +231,26 @@ async def check_vehicle(plate_ocr: str) -> dict:
     )
 
     if not authorized:
-        # Vehicule non autorise — creer une notification de refus
+        # Permanent refusé — vérifier s'il existe un temporaire en_attente
+        # pour le même matricule avant de conclure au refus définitif.
+        # Le cache ne contient que les temporaires statut="en_attente",
+        # donc toute entrée is_temporaire=True trouvée ici est valide.
+        for v in vehicle_cache._cache_vehicles:
+            if (
+                v.get("plate_number", "").upper() == plate_corrige.upper()
+                and v.get("is_temporaire")
+            ):
+                logger.info(
+                    "Permanent refusé pour %s — temporaire en_attente trouvé, fallback.",
+                    plate_corrige,
+                )
+                return await _handle_temporaire(v, plate_corrige, similarity)
+
+        # Aucun temporaire trouvé — refus confirmé
         await creer_notification(
             backend_url=BACKEND_URL,
             type_notif="refus_acces",
-            message=f"Tentative d'acces refusee — plaque {plate_corrige}",
+            message=f"Tentative d'accès refusée — plaque {plate_corrige}",
             plate_number=plate_corrige,
         )
         return {
@@ -348,7 +363,14 @@ async def _handle_temporaire(
         "plate_matched": plate_corrige,
         "similarity_score": round(similarity, 4),
         "vehicle": vehicule,
-        "owner": None,
+        # Champs visiteur extraits du cache pour l'affichage côté Flutter
+        "owner": {
+            "nom":             vehicule.get("nom_visiteur", ""),
+            "prenom":          vehicule.get("prenom_visiteur", ""),
+            "telephone":       vehicule.get("telephone"),
+            "motif_visite":    vehicule.get("motif_visite"),
+            "duree_autorisee": vehicule.get("duree_autorisee"),
+        },
         "acces_enregistre": acces_enregistre,
     }
 
