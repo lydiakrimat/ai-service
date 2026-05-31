@@ -54,6 +54,10 @@ async def verifier_expirations(backend_url: str):
                         continue
                     if acces.get("statut") != "Autorise":
                         continue
+                    # Ignorer les accès dont la sortie est déjà enregistrée
+                    # (le véhicule est sorti normalement via le scan de sortie)
+                    if acces.get("dateHeureSortie") is not None:
+                        continue
 
                     # Utiliser dateHeureEntree (heure reelle d'entree du visiteur)
                     # et non created_at (timestamp de creation du record Eloquent)
@@ -101,6 +105,29 @@ async def verifier_expirations(backend_url: str):
                         heure_entree = heure_entree.replace(tzinfo=timezone.utc)
                     maintenant = datetime.now(timezone.utc)
                     minutes_ecoulees = (maintenant - heure_entree).total_seconds() / 60
+
+                    # Vérifier si le véhicule est encore sur le site avant de notifier.
+                    # Si le véhicule est déjà sorti (dateHeureSortie remplie),
+                    # c'est une sortie normale — pas de notification d'expiration.
+                    try:
+                        resp_en_cours = await client.get(
+                            f"{service_prefix}/acces/en-cours",
+                            params={"plate_number_visiteur": plate},
+                            headers=_HEADERS,
+                        )
+                        if resp_en_cours.status_code == 200:
+                            en_cours = resp_en_cours.json().get("en_cours", False)
+                            if not en_cours:
+                                logger.info(
+                                    "Acces %d : vehicule %s deja sorti, skip notification.",
+                                    acces["id"], plate,
+                                )
+                                continue
+                    except Exception as e:
+                        logger.warning(
+                            "Expiration checker : erreur verification en_cours pour %s : %s",
+                            plate, e,
+                        )
 
                     logger.info(
                         "Acces %d expire (%.1f min >= %d min). Mise a jour...",

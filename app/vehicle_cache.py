@@ -43,7 +43,13 @@ async def _load_vehicles(backend_url: str) -> list:
         resp_perm.raise_for_status()
         vehicles = resp_perm.json()
 
-        # Véhicules temporaires (seuls ceux en_attente sont chargés)
+        # Vehicules temporaires : l'endpoint /api/service/vehicules-temporaires
+        # retourne uniquement les VT pertinents pour le cache :
+        #   - en_attente : visiteur attendu (entree)
+        #   - entré      : visiteur sur site (sortie dans les temps)
+        #   - expiré     : visiteur encore sur site apres expiration de la duree
+        #                  (filtre cote Laravel via sous-requete sur acces)
+        # Tous les VT retournes sont ajoutes au cache sans filtre supplementaire.
         try:
             resp_temp = await client.get(
                 f"{backend_url}/api/service/vehicules-temporaires",
@@ -53,9 +59,8 @@ async def _load_vehicles(backend_url: str) -> list:
             temporaires = resp_temp.json()
 
             for vt in temporaires:
-                if vt.get("statut") == "en_attente":
-                    vt["is_temporaire"] = True
-                    vehicles.append(vt)
+                vt["is_temporaire"] = True
+                vehicles.append(vt)
         except (httpx.HTTPStatusError, httpx.ConnectError) as e:
             logger.warning("Impossible de charger les véhicules temporaires : %s", e)
 
@@ -112,8 +117,11 @@ async def get_best_match(
         logger.info("Aucun match pour '%s' (seuil %.0f%%).", plate_ocr, threshold * 100)
         return None
 
-    # Priorité : temporaire en_attente (1) > permanent autorisé (2) > permanent refusé (3).
-    # À priorité égale, le score de similarité le plus élevé l'emporte.
+    # Priorite : temporaire (1) > permanent autorise (2) > permanent refuse (3).
+    # Les trois statuts temporaires (en_attente, entré, expiré) ont la meme
+    # priorite maximale : un temporaire dans le cache est toujours la bonne
+    # reponse (entree, sortie dans les temps, ou sortie apres expiration).
+    # A priorite egale, le score de similarite le plus eleve l'emporte.
     def _priorite(item: tuple[dict, float]) -> tuple[int, float]:
         v, score = item
         if v.get("is_temporaire"):

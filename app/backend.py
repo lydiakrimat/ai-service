@@ -68,30 +68,26 @@ async def record_access(
     plate_number: str,
     vehicle_id: int,
     employee_id: int | None = None,
-) -> bool:
+) -> dict:
     """
     Enregistre un accès autorisé dans l'historique Laravel via POST /api/acces.
+    Laravel applique la logique entrée/sortie automatiquement :
+      - Si le véhicule est déjà sur site → enregistre la sortie
+      - Sinon → enregistre l'entrée
 
     Paramètres :
         plate_number : str      — plaque corrigée, utilisée uniquement pour le cooldown
         vehicle_id   : int      — identifiant du véhicule dans la table vehicles
         employee_id  : int|None — identifiant de l'employé dans la table employes
-                                   (vehicles.employee_id). Nullable : si absent,
-                                   l'accès est quand même enregistré sans employé lié.
 
     Retourne :
-        True  — accès enregistré avec succès
-        False — cooldown actif, l'accès a déjà été enregistré récemment (pas de doublon)
-
-    Lève :
-        httpx.ConnectError / httpx.TimeoutException si Laravel inaccessible
-        httpx.HTTPStatusError si Laravel retourne une erreur HTTP
+        dict avec "enregistre": bool, "type_passage": str|None, "type_vehicule": str|None
+        enregistre=False si le cooldown est actif (pas de doublon)
     """
     maintenant = time.monotonic()
 
     # Vérifier le cooldown : si la même plaque a déjà été enregistrée
     # dans la dernière minute, on ne crée pas un deuxième enregistrement.
-    # Cela protège contre le WebSocket qui traite 2 frames/s de la même voiture.
     dernier = _derniers_acces.get(plate_number, 0.0)
     if maintenant - dernier < _ACCES_COOLDOWN_SECONDES:
         logger.info(
@@ -99,20 +95,15 @@ async def record_access(
             plate_number,
             maintenant - dernier,
         )
-        return False
+        return {"enregistre": False, "type_passage": None, "type_vehicule": None}
 
     # Corps JSON envoyé à POST /api/acces (Laravel)
-    # type_acces "Permanent" = véhicule d'employé avec plaque enregistrée
-    # employe_id correspond à vehicles.employee_id (table employes),
-    # validé côté Laravel via exists:employes,id
     payload = {
         "type_acces": "Permanent",
         "vehicle_id": vehicle_id,
         "statut": "Autorise",
     }
 
-    # Ajouter l'identifiant de l'employé si disponible
-    # (récupéré depuis vehicles.employee_id dans check_vehicle)
     if employee_id is not None:
         payload["employe_id"] = employee_id
 
@@ -123,15 +114,18 @@ async def record_access(
             headers=_HEADERS,
         )
         resp.raise_for_status()
+        data = resp.json()
 
     # Mémoriser le timestamp pour le cooldown
     _derniers_acces[plate_number] = maintenant
+
+    type_passage  = data.get("type_passage")
+    type_vehicule = data.get("type_vehicule")
     logger.info(
-        "Acces enregistre en BDD : vehicle_id=%d, plaque=%s.",
-        vehicle_id,
-        plate_number,
+        "Acces enregistre en BDD : vehicle_id=%d, plaque=%s, type_passage=%s.",
+        vehicle_id, plate_number, type_passage,
     )
-    return True
+    return {"enregistre": True, "type_passage": type_passage, "type_vehicule": type_vehicule}
 
 
 async def creer_notification(
@@ -231,10 +225,9 @@ async def check_vehicle(plate_ocr: str) -> dict:
     )
 
     if not authorized:
-        # Permanent refusé — vérifier s'il existe un temporaire en_attente
+        # Permanent refusé — vérifier s'il existe un temporaire (en_attente ou entré)
         # pour le même matricule avant de conclure au refus définitif.
-        # Le cache ne contient que les temporaires statut="en_attente",
-        # donc toute entrée is_temporaire=True trouvée ici est valide.
+        # Le cache contient les temporaires avec statut 'en_attente' et 'entré'.
         for v in vehicle_cache._cache_vehicles:
             if (
                 v.get("plate_number", "").upper() == plate_corrige.upper()
@@ -265,13 +258,19 @@ async def check_vehicle(plate_ocr: str) -> dict:
 
     # Véhicule autorisé : enregistrer l'accès dans l'historique Laravel.
     # Le cooldown évite les doublons si le WebSocket traite plusieurs frames.
+    # Laravel applique la logique entrée/sortie et retourne type_passage.
     vehicle_id  = vehicle.get("id")
     employee_id = vehicle.get("employee_id")
     acces_enregistre = False
+    type_passage  = None
+    type_vehicule = None
 
     if vehicle_id is not None:
         try:
-            acces_enregistre = await record_access(plate_corrige, vehicle_id, employee_id)
+            result_acces = await record_access(plate_corrige, vehicle_id, employee_id)
+            acces_enregistre = result_acces["enregistre"]
+            type_passage     = result_acces["type_passage"]
+            type_vehicule    = result_acces["type_vehicule"]
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
             logger.warning(
                 "Echec enregistrement acces pour %s (vehicle_id=%s) : %s",
@@ -286,6 +285,8 @@ async def check_vehicle(plate_ocr: str) -> dict:
         "vehicle": _format_vehicle(vehicle),
         "owner": owner,
         "acces_enregistre": acces_enregistre,
+        "type_passage": type_passage,
+        "type_vehicule": type_vehicule,
     }
 
 
@@ -296,12 +297,19 @@ async def _handle_temporaire(
     similarity: float,
 ) -> dict:
     """
-    Gère l'accès d'un véhicule temporaire (visiteur pré-autorisé).
-    1. Enregistre l'accès dans la table acces via POST /api/acces
-    2. Met à jour le statut du véhicule temporaire à "entré" via PATCH
-    3. Invalide le cache pour que le véhicule ne soit plus matché
+    Gere l'acces d'un vehicule temporaire (visiteur pre-autorise).
+
+    Trois cas selon le statut du vehicule dans le cache :
+      - statut 'en_attente' → ENTREE : creer l'acces, passer statut a 'entre'
+      - statut 'entre'      → SORTIE : enregistrer dateHeureSortie, passer statut a 'expire'
+      - statut 'expire'     → SORTIE APRES EXPIRATION : le VT est encore sur site
+        mais sa duree a expire (traite par expiration_checker). On enregistre
+        uniquement dateHeureSortie. Le statut VT est deja 'expire'.
+
+    Dans tous les cas, le cache est invalide apres modification.
     """
-    vt_id = vehicule.get("id")
+    vt_id  = vehicule.get("id")
+    statut = vehicule.get("statut", "en_attente")
     acces_enregistre = False
 
     # Cooldown anti-doublon
@@ -318,43 +326,120 @@ async def _handle_temporaire(
             "vehicle": vehicule,
             "owner": None,
             "acces_enregistre": False,
+            "type_passage": None,
+            "type_vehicule": "temporaire",
         }
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # POST /api/acces — enregistrer l'entrée du visiteur
-            payload_acces = {
-                "type_acces": "Temporaire",
-                "nom_visiteur": vehicule.get("nom_visiteur", ""),
-                "prenom_visiteur": vehicule.get("prenom_visiteur", ""),
-                "plate_number_visiteur": plate_corrige,
-                "duree_autorisee": vehicule.get("duree_autorisee", 60),
-                "dateHeureEntree": datetime.now().isoformat(),
-                "statut": "Autorise",
-            }
-            resp_acces = await client.post(
-                f"{_SERVICE_PREFIX}/acces",
-                json=payload_acces,
-                headers=_HEADERS,
+    type_passage = None
+
+    if statut == "entré":
+        # ── CAS SORTIE : le visiteur quitte le site ──────────────────────
+        # Le véhicule est déjà sur site (statut 'entré' dans le cache).
+        # On enregistre sa sortie via l'endpoint dédié, puis on passe
+        # le statut VT à 'expiré' (visite terminée).
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # 1. Enregistrer la sortie dans la table acces
+                resp_sortie = await client.patch(
+                    f"{_SERVICE_PREFIX}/acces/sortie-temporaire",
+                    json={"plate_number": plate_corrige},
+                    headers=_HEADERS,
+                )
+                resp_sortie.raise_for_status()
+                sortie_data = resp_sortie.json()
+                acces_enregistre = sortie_data.get("success", False)
+                type_passage = "sortie"
+
+                # 2. Passer le statut du VT à 'expiré'
+                if vt_id is not None:
+                    resp_patch = await client.patch(
+                        f"{_SERVICE_PREFIX}/vehicules-temporaires/{vt_id}",
+                        json={"statut": "expiré"},
+                        headers=_HEADERS,
+                    )
+                    resp_patch.raise_for_status()
+
+            # Invalider le cache (le VT 'expiré' ne sera plus chargé)
+            vehicle_cache.invalidate_cache()
+            _derniers_acces[plate_corrige] = maintenant
+            logger.info(
+                "Véhicule temporaire %s (id=%s) : sortie enregistrée, statut → expiré.",
+                plate_corrige, vt_id,
             )
-            resp_acces.raise_for_status()
-            acces_enregistre = True
 
-            # PUT /api/service/vehicules-temporaires/{id} — marquer "entré"
-            resp_patch = await client.put(
-                f"{_SERVICE_PREFIX}/vehicules-temporaires/{vt_id}",
-                json={"statut": "entré"},
-                headers=_HEADERS,
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            logger.warning("Echec sortie véhicule temporaire %s : %s", plate_corrige, e)
+
+    elif statut == "expiré":
+        # ── CAS SORTIE APRES EXPIRATION ──────────────────────────────
+        # Le visiteur est encore sur site mais sa duree a expire.
+        # L'expiration_checker a deja passe le statut VT a 'expire' et le
+        # statut acces a 'Expire'. On enregistre uniquement dateHeureSortie
+        # via le meme endpoint que la branche 'entre'. Pas besoin de patcher
+        # le statut VT (deja 'expire').
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp_sortie = await client.patch(
+                    f"{_SERVICE_PREFIX}/acces/sortie-temporaire",
+                    json={"plate_number": plate_corrige},
+                    headers=_HEADERS,
+                )
+                resp_sortie.raise_for_status()
+                sortie_data = resp_sortie.json()
+                acces_enregistre = sortie_data.get("success", False)
+                type_passage = "sortie"
+
+            # Invalider le cache (le VT disparaitra car dateHeureSortie
+            # est maintenant remplie — la sous-requete Laravel ne le
+            # retournera plus)
+            vehicle_cache.invalidate_cache()
+            _derniers_acces[plate_corrige] = maintenant
+            logger.info(
+                "Véhicule temporaire %s (id=%s) : sortie après expiration enregistrée.",
+                plate_corrige, vt_id,
             )
-            resp_patch.raise_for_status()
 
-        # Invalider le cache pour retirer ce véhicule temporaire
-        vehicle_cache.invalidate_cache()
-        _derniers_acces[plate_corrige] = maintenant
-        logger.info("Véhicule temporaire %s (id=%s) : accès enregistré, statut → entré.", plate_corrige, vt_id)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            logger.warning(
+                "Echec sortie après expiration véhicule temporaire %s : %s",
+                plate_corrige, e,
+            )
 
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-        logger.warning("Echec traitement véhicule temporaire %s : %s", plate_corrige, e)
+    else:
+        # ── CAS ENTRÉE : le visiteur arrive sur le site ──────────────────
+        # Comportement identique à l'original : POST /api/acces pour créer
+        # l'entrée, Laravel met à jour le statut VT à 'entré' en interne.
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                payload_acces = {
+                    "type_acces": "Temporaire",
+                    "nom_visiteur": vehicule.get("nom_visiteur", ""),
+                    "prenom_visiteur": vehicule.get("prenom_visiteur", ""),
+                    "plate_number_visiteur": plate_corrige,
+                    "duree_autorisee": vehicule.get("duree_autorisee", 60),
+                    "dateHeureEntree": datetime.now().isoformat(),
+                    "statut": "Autorise",
+                }
+                resp_acces = await client.post(
+                    f"{_SERVICE_PREFIX}/acces",
+                    json=payload_acces,
+                    headers=_HEADERS,
+                )
+                resp_acces.raise_for_status()
+                acces_data = resp_acces.json()
+                acces_enregistre = True
+                type_passage = acces_data.get("type_passage", "entree")
+
+            # Invalider le cache (le VT passera de 'en_attente' à 'entré')
+            vehicle_cache.invalidate_cache()
+            _derniers_acces[plate_corrige] = maintenant
+            logger.info(
+                "Véhicule temporaire %s (id=%s) : entrée enregistrée, statut → entré.",
+                plate_corrige, vt_id,
+            )
+
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            logger.warning("Echec entrée véhicule temporaire %s : %s", plate_corrige, e)
 
     return {
         "authorized": True,
@@ -363,7 +448,6 @@ async def _handle_temporaire(
         "plate_matched": plate_corrige,
         "similarity_score": round(similarity, 4),
         "vehicle": vehicule,
-        # Champs visiteur extraits du cache pour l'affichage côté Flutter
         "owner": {
             "nom":             vehicule.get("nom_visiteur", ""),
             "prenom":          vehicule.get("prenom_visiteur", ""),
@@ -372,6 +456,8 @@ async def _handle_temporaire(
             "duree_autorisee": vehicule.get("duree_autorisee"),
         },
         "acces_enregistre": acces_enregistre,
+        "type_passage": type_passage,
+        "type_vehicule": "temporaire",
     }
 
 

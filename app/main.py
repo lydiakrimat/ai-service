@@ -204,6 +204,9 @@ async def _full_scan_result(image_bytes: bytes) -> dict:
         "owner": check["owner"],
         # Indique si un enregistrement a été créé dans la table acces
         "acces_enregistre": check.get("acces_enregistre", False),
+        # Type de passage : 'entree' ou 'sortie' (logique entrée/sortie Laravel)
+        "type_passage": check.get("type_passage"),
+        "type_vehicule": check.get("type_vehicule"),
     }
 
 
@@ -684,6 +687,8 @@ async def ws_detect(websocket: WebSocket):
                             "vehicle": check["vehicle"],
                             "owner": check["owner"],
                             "acces_enregistre": check.get("acces_enregistre", False),
+                            "type_passage": check.get("type_passage"),
+                            "type_vehicule": check.get("type_vehicule"),
                         }
 
                     else:
