@@ -38,29 +38,59 @@ L'AI Service communique avec le backend Laravel via des **routes internes** (`/a
 | Appel                                     | But                                        |
 |-------------------------------------------|--------------------------------------------|
 | `GET /api/service/vehicles`               | Charger le cache des vehicules permanents  |
-| `GET /api/service/vehicules-temporaires`  | Charger les vehicules temporaires (en_attente) |
+| `GET /api/service/vehicules-temporaires`  | Charger les VT pertinents pour le cache (en_attente, entré, expiré encore sur site) |
 | `POST /api/service/vehicles/check`        | Verifier autorisation d'un vehicule        |
 | `POST /api/service/acces`                 | Enregistrer un acces dans l'historique     |
 | `GET /api/service/acces`                  | Liste des acces (pour expiration checker)  |
+| `PATCH /api/service/acces/sortie-temporaire` | Enregistrer la sortie d'un VT (par plate_number) |
 | `PATCH /api/service/acces/{id}`           | Mettre a jour statut acces (Expire)        |
-| `PUT /api/service/vehicules-temporaires/{id}` | Mettre a jour statut (entre)           |
-| `PATCH /api/service/vehicules-temporaires/{id}` | Mettre a jour statut (expire)        |
+| `PUT /api/service/vehicules-temporaires/{id}` | Mettre a jour statut (entré)           |
+| `PATCH /api/service/vehicules-temporaires/{id}` | Mettre a jour statut (expiré)        |
 | `POST /api/notifications`                 | Creer une notification (refus ou expiration) |
 
-### Flux de verification
+### Flux de verification (scan camera + recherche manuelle)
 
 ```
 1. Cache memoire (vehicules permanents + temporaires en_attente)
    └── Rafraichi toutes les 5 min via GET /api/service/vehicles + vehicules-temporaires
 
 2. Fuzzy matching local (pas d'appel reseau)
-   └── Score >= 80% → match trouve
+   └── Score >= 80% → collecte tous les candidats
+   └── Priorité : temporaire (1) > permanent autorisé (2) > permanent refusé (3)
 
 3. Vehicule permanent → POST /api/service/vehicles/check
    └── Autorise → POST /api/service/acces (cooldown 60s anti-doublon)
+   └── Refuse → second passage dans le cache pour chercher un temporaire en_attente
+       avant de confirmer le refus definitif
 
-4. Vehicule temporaire → POST /api/service/acces + PUT statut "entre"
+4. Vehicule temporaire (scan camera) :
+   └── POST /api/service/acces (enregistrement de l'entree)
+   └── PUT /api/service/vehicules-temporaires/{id} → statut "entré"
    └── Cache invalide pour retirer le vehicule temporaire
+   └── Retourne type="temporaire" + champs visiteur dans owner
+       (nom, prenom, telephone, motif_visite, duree_autorisee)
+   └── Le champ "type" est transmis a Flutter via le WebSocket /ws/detect
+
+5. Vehicule temporaire (recherche manuelle /verify-lookup) :
+   └── Retourne authorized=True directement (pas d'appel vehicles/check)
+   └── Retourne type="temporaire" + champs visiteur dans owner
+       (nom, prenom, telephone, motif_visite, duree_autorisee)
+   └── L'enregistrement et la mise a jour du statut sont faits
+       par Flutter via POST /api/acces (AccesController::store)
+```
+
+### Cycle de vie d'un vehicule temporaire
+
+```
+en_attente → entré → expiré
+     │          │        │
+     │          │        └── expiration_checker.py detecte le depassement
+     │          │            de duree_autorisee et passe le statut a "expiré"
+     │          │
+     │          └── Scan camera : backend.py _handle_temporaire()
+     │              Recherche manuelle : AccesController::store()
+     │
+     └── Creation via le dashboard (POST /api/vehicules-temporaires)
 ```
 
 **Appels reseau par scan** :
@@ -251,14 +281,17 @@ await creer_notification(
 ### Notifications d'expiration (`duree_expiree`)
 
 Creees par `expiration_checker.py` — tache de fond lancee au demarrage dans `lifespan()`.
+C'est le **seul mecanisme d'expiration actif** (le scheduler Laravel `acces:expire` a ete desactive pour eviter les doublons de notifications et une race condition avec `AccesController::expireOutdated()`).
 
 **Fonctionnement :**
 1. Toutes les 60 secondes, recupere les acces temporaires via `GET /api/service/acces`
-2. Pour chaque acces temporaire avec statut "Autorise", verifie si `duree_autorisee` est depassee
+2. Pour chaque acces temporaire avec statut "Autorise", verifie si `dateHeureEntree + duree_autorisee` est depasse
 3. Si expire :
    - `PATCH /api/service/acces/{id}` → statut "Expire"
-   - `PATCH /api/service/vehicules-temporaires/{id}` → statut "expire"
+   - Recherche du vehicule temporaire par `plate_number_visiteur` + statut "entré" via `GET /api/service/vehicules-temporaires`
+   - `PATCH /api/service/vehicules-temporaires/{id}` → statut "expiré"
    - `POST /api/notifications` → notification `duree_expiree`
+4. Le GET vehicules-temporaires est fait une seule fois par cycle, uniquement si au moins un acces a expire
 
 ### Proprietes des notifications
 
@@ -273,6 +306,41 @@ La fonction `creer_notification()` est **non bloquante** : une erreur lors de la
 - **Seuil de detection** : confidence YOLOX >= 0.85 pour declencher l'OCR
 - **Seuil fuzzy matching** : similarite >= 80% pour considerer un match
 - **Preprocessing OCR** : resize x3 + sharpening avant PaddleOCR
-- **Cache vehicules** : TTL 5 minutes, inclut permanents + temporaires (en_attente)
+- **Cache vehicules** : TTL 5 minutes, inclut permanents + temporaires (en_attente, entré, expiré encore sur site)
 - **Cooldown anti-doublon** : 60 secondes par plaque pour eviter les doublons d'acces
 - **Les modeles ne se chargent qu'une seule fois** au demarrage du serveur
+- **Tables separees** : `vehicles` (employes, matricule unique) et `vehicules_temporaires` (visiteurs, meme matricule peut se repeter)
+- **Expiration** : geree exclusivement par `expiration_checker.py` (asyncio, pas de cron requis). Le scheduler Laravel (`console.php acces:expire`) est desactive
+
+---
+
+## Historique des modifications
+
+### Session 6 — Sortie des véhicules temporaires expirés
+- `vehicle_cache.py` : le cache accepte désormais tous les VT retournés par Laravel (le filtrage
+  est fait côté Laravel). La priorité est simplifiée : temporaire (1) > permanent autorisé (2) >
+  permanent refusé (3), quel que soit le statut du temporaire.
+- `backend.py` : nouveau bloc `elif statut == "expiré"` dans `_handle_temporaire()`. Appelle
+  `PATCH /api/service/acces/sortie-temporaire` pour enregistrer la sortie sans modifier le statut
+  du VT (déjà expiré). Invalide le cache après l'opération.
+
+### Session 5 — Correction affichage scan camera pour vehicules temporaires
+- `backend.py` : `_handle_temporaire()` retourne desormais les champs visiteur dans `owner` (nom, prenom, telephone, motif_visite, duree_autorisee) au lieu de `None`. Les donnees sont extraites du cache vehicule.
+- `main.py` : le WebSocket `/ws/detect` transmet le champ `type` (ex: `"temporaire"`) dans le JSON envoye a Flutter — il etait precedemment ignore lors de la construction du dict `result`.
+
+### Session 4 — Expiration et notifications
+- `expiration_checker.py` : correction du champ de reference temporelle (`created_at` → `dateHeureEntree`), accent sur le statut (`"expire"` → `"expiré"`), recherche du vehicule temporaire par `plate_number` + statut `"entré"` (la table `acces` n'a pas de colonne `vehicule_temporaire_id`)
+- Optimisation : le GET vehicules-temporaires est fait une seule fois par cycle
+- Desactivation du scheduler Laravel `acces:expire` (doublons + race condition)
+- Desactivation de `AccesController::expireOutdated()` dans `index()`
+
+### Session 3 — Mise a jour statut vehicule temporaire
+- `AccesController::store()` : apres creation d'un acces temporaire, passe `vehicules_temporaires.statut` de `"en_attente"` a `"entré"` (recherche par `plate_number` + `latest()`)
+
+### Session 2 — Support vehicules temporaires
+- `vehicle_cache.py` : `get_best_match()` collecte tous les candidats et applique une priorite (temporaire > permanent autorise > permanent refuse)
+- `backend.py` : `check_vehicle()` fait un second passage pour les temporaires en_attente apres un refus permanent ; `_handle_temporaire()` enregistre l'acces + met le statut a "entré" + invalide le cache
+- `main.py` : `/verify-lookup` retourne `authorized=True` directement pour les temporaires, avec champs visiteur et `type: "temporaire"`
+
+### Session 1 — Mise en place initiale
+- Pipeline IA (YOLOX + PaddleOCR), fuzzy matching, cache vehicules, enregistrement d'acces, notifications de refus
